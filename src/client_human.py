@@ -54,13 +54,6 @@ def safe_print(message: str) -> None:
         redraw_prompt()
 
 
-def local_echo_sent_message(message: str) -> None:
-    with print_lock:
-        clear_current_input()
-        sys.stdout.write(f"{PROMPT}{message}\n")
-        redraw_prompt()
-
-
 def receive_loop(sock: socket.socket, stop_event: threading.Event) -> None:
     reader = None
     try:
@@ -201,7 +194,6 @@ def main() -> None:
                 continue
 
             try:
-                local_echo_sent_message(message)
                 sock.sendall((message + "\n").encode(ENCODING))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 safe_print("[SYSTEM] Unable to send message. Server may be offline.")
