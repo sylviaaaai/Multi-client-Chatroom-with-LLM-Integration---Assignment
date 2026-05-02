@@ -5,6 +5,7 @@ import argparse
 import os
 import queue
 import random
+import re
 import socket
 import sys
 import threading
@@ -21,26 +22,65 @@ CLEAR_LINE = "\r" + (" " * 120) + "\r"
 
 STYLE_PROFILES = {
     "calm": {
-        "fillers": ["honestly", "fair", "maybe", "probably"],
-        "avoid": ["lol", "ugh", "lmao"],
-        "tone_hint": "calm, plain, low-energy, not too slangy",
-    },
-    "playful": {
-        "fillers": ["lol", "haha", "honestly", "wait"],
-        "avoid": ["ugh"],
-        "tone_hint": "light, playful, casual, a little expressive",
-    },
-    "dry": {
-        "fillers": ["yeah", "true", "fair", "tbh"],
-        "avoid": ["lol", "haha", "ugh"],
-        "tone_hint": "dry, brief, understated, low-emotion",
+        "avoid": ["lol", "lmao", "haha", "ugh"],
+        "persona": (
+            "You are a steady college student who likes classes, coffee, quiet study spots, "
+            "and getting assignments done without drama."
+        ),
+        "tone_hint": (
+            "calm and practical. You answer plainly, keep emotion low, "
+            "and sound like someone focused on getting through schoolwork."
+        ),
     },
     "warm": {
-        "fillers": ["hey", "honestly", "aw", "yeah"],
-        "avoid": ["ugh"],
-        "tone_hint": "friendly, warm, easygoing, not too slangy",
+        "avoid": ["lmao", "whatever", "ugh"],
+        "persona": (
+            "You are a friendly college student who likes food, music, weekend plans, "
+            "and checking in on people when they sound stressed."
+        ),
+        "tone_hint": (
+            "warm and supportive. You sound friendly, notice how others feel, "
+            "and give relaxed encouragement without sounding formal."
+        ),
+    },
+    "intl": {
+        "avoid": ["therefore", "moreover", "as an ai", "i would recommend", "i think", "in my opinion"],
+        "imperfect_english": False,
+        "persona": (
+            "You are an international student from Asia studying computer science. "
+            "You chat casually with classmates about school, assignments, games, and daily life, "
+            "responding naturally to what others say without sounding robotic."
+        ),
+        "tone_hint": (
+            "casual and friendly. Use short, natural sentences that fit the conversation, "
+            "respond directly to recent messages, and sound like a real student chatting with friends."
+        ),
     },
 }
+
+REPLY_MODES = [
+    "react briefly",
+    "answer casually and ask a small follow-up",
+    "make a casual comment",
+    "share a tiny personal opinion",
+    "continue the current topic without asking a question",
+    "change topic slightly only if the chat feels repetitive",
+]
+
+TOPIC_POOL = [
+    "Hogwarts Legacy being free on Epic again and who wants to play it",
+    "how last week's CS311 final exam went and whether it felt hard",
+    "CS311 topics like TCP, DNS, HTTP caches, NAT, routing, and firewalls",
+    "the multi-client chatroom assignment and small bugs in the server or client",
+    "UDP authenticator homework, timeouts, retransmission, SAS, and GAS tokens",
+    "cheap food near campus after class",
+    "final exams, late studying, and being tired",
+    "weekend plans after finishing assignments",
+    "music or games to relax after studying",
+    "coffee before debugging code",
+    "group projects and last-minute fixes",
+    "weather being weird on campus",
+]
 
 print_lock = threading.Lock()
 
@@ -56,15 +96,32 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", ""), help="API key")
 
     parser.add_argument("--history-size", type=int, default=24, help="Conversation history size")
-    parser.add_argument("--join-greeting-chance", type=float, default=0.70, help="Chance to greet a newly joined user")
+    parser.add_argument(
+        "--join-greeting-chance",
+        type=float,
+        default=0.70,
+        help="Chance to greet a newly joined user",
+    )
     parser.add_argument("--cooldown", type=float, default=2.0, help="Minimum seconds between replies")
     parser.add_argument("--min-delay", type=float, default=1.6, help="Minimum reply delay")
     parser.add_argument("--max-delay", type=float, default=3.8, help="Maximum reply delay")
+    parser.add_argument(
+        "--char-delay",
+        type=float,
+        default=0.12,
+        help="Extra delay seconds per reply character",
+    )
+    parser.add_argument(
+        "--max-length-delay",
+        type=float,
+        default=6.0,
+        help="Maximum extra delay added for long replies",
+    )
     parser.add_argument("--request-timeout", type=float, default=20.0, help="LLM API timeout seconds")
     parser.add_argument("--debug", action="store_true", help="Print debug messages")
     parser.add_argument(
         "--style",
-        choices=["auto", "calm", "playful", "dry", "warm"],
+        choices=["auto", "calm", "warm", "intl"],
         default="auto",
         help="Speaking style for this AI client",
     )
@@ -74,8 +131,7 @@ def create_parser() -> argparse.ArgumentParser:
 def resolve_style(username: str, style_arg: str) -> str:
     if style_arg != "auto":
         return style_arg
-    styles = ["calm", "playful", "dry", "warm"]
-    return styles[sum(ord(c) for c in username) % len(styles)]
+    return random.choice(["calm", "warm", "intl"])
 
 
 def get_style_profile(username: str, style_arg: str) -> dict:
@@ -98,6 +154,18 @@ def safe_print(message: str) -> None:
 def debug_print(enabled: bool, message: str) -> None:
     if enabled:
         safe_print(f"[DEBUG] {message}")
+
+
+def calculate_reply_delay(
+    message: str,
+    min_delay: float,
+    max_delay: float,
+    char_delay: float,
+    max_length_delay: float,
+) -> float:
+    base_delay = random.uniform(min_delay, max_delay)
+    length_delay = min(len(message) * char_delay, max_length_delay)
+    return base_delay + length_delay
 
 
 def local_echo_sent_message(message: str) -> None:
@@ -151,29 +219,6 @@ def validate_name(username: str) -> str:
     return username
 
 
-def sanitize_reply(text: str) -> str:
-    text = " ".join(text.replace("\n", " ").split()).strip()
-
-    if not text:
-        return ""
-
-    # Trim quotes often produced by APIs/models
-    text = text.strip("\"'“”‘’").strip()
-
-    # Keep replies short and chat-like
-    if len(text) > 100:
-        text = text[:100].rsplit(" ", 1)[0].strip()
-
-    # Remove obvious speaker prefix if model returns one
-    if ": " in text:
-        prefix, rest = text.split(": ", 1)
-        if len(prefix) <= 20:
-            text = rest.strip()
-
-    text = soften_repeated_slang(text)
-    return text.strip()
-
-
 def soften_repeated_slang(text: str) -> str:
     replacements = {
         "lol lol": "lol",
@@ -186,6 +231,133 @@ def soften_repeated_slang(text: str) -> str:
         if bad in lowered:
             text = text.replace(bad, good)
             text = text.replace(bad.title(), good)
+    return text
+
+
+def strip_emoji_and_symbols(text: str) -> str:
+    # common emoticons / text faces
+    patterns = [
+        r":\)", r":-\)", r":\(", r":-\(",
+        r";\)", r";-\)", r":D", r":-D",
+        r"xD", r"XD", r"<3",
+        r":P", r":-P", r":p", r":-p",
+        r"\^_\^", r"T_T", r"ㅠㅠ",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+
+    # unicode emoji / pictographs
+    text = re.sub(r"[\U0001F300-\U0001FAFF]", "", text)
+    text = re.sub(r"[\U00002600-\U000027BF]", "", text)
+
+    # decorative symbols often used like emoji substitutes
+    text = re.sub(r"[~～✨⭐🌟❤❤️💕💖😂🤣😭😊😅🙂🙃😉😎🤔🙏👍]", "", text)
+
+    return " ".join(text.split()).strip()
+
+
+def strip_stickers_and_emoji(text: str) -> str:
+    # Markdown/image reactions and common text faces.
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(
+        r"(?i)(:-?\)|:-?\(|;-?\)|:-?d|x-?d|<3|:-?p|t_t|\^_?\^|orz)",
+        "",
+        text,
+    )
+
+    # Bracketed sticker-style reactions such as [doge], [smile], (笑哭), or （捂脸）.
+    reaction_words = (
+        r"doge|smile|laugh|cry|meme|sticker|emoji|"
+        r"笑|哭|捂脸|狗头|旺柴|裂开|尴尬|害羞|流泪|开心|汗|表情|摊手"
+    )
+    text = re.sub(rf"[\[【(（][^\]】)）]{{0,20}}(?:{reaction_words})[^\]】)）]{{0,20}}[\]】)）]", "", text)
+
+    # Unicode emoji, pictographs, dingbats, and variation selectors.
+    text = re.sub(r"[\U0001F000-\U0001FAFF]", "", text)
+    text = re.sub(r"[\U00002600-\U000027BF]", "", text)
+    text = re.sub(r"[\U0000FE00-\U0000FE0F]", "", text)
+
+    # Decorative symbols often used as emoji substitutes.
+    text = re.sub(r"[~♡♥★☆♪♫]+", "", text)
+
+    return " ".join(text.split()).strip()
+
+
+def strip_bracketed_reactions(text: str) -> str:
+    reaction_words = (
+        "doge|smile|laugh|cry|meme|sticker|emoji|"
+        "\u7b11|\u54ed|\u6342\u8138|\u72d7\u5934|\u65fa\u67f4|"
+        "\u88c2\u5f00|\u5c34\u5c2c|\u5bb3\u7f9e|\u6d41\u6cea|"
+        "\u5f00\u5fc3|\u6c57|\u8868\u60c5|\u644a\u624b"
+    )
+    open_brackets = r"\[\(\u3010\uff08"
+    close_brackets = r"\]\)\u3011\uff09"
+    return re.sub(
+        rf"[{open_brackets}][^{close_brackets}]{{0,20}}"
+        rf"(?:{reaction_words})"
+        rf"[^{close_brackets}]{{0,20}}[{close_brackets}]",
+        "",
+        text,
+    )
+
+
+def sanitize_reply(text: str) -> str:
+    text = " ".join(text.replace("\n", " ").split()).strip()
+
+    if not text:
+        return ""
+
+    text = text.strip("\"'“”‘’").strip()
+
+    if len(text) > 100:
+        text = text[:100].rsplit(" ", 1)[0].strip()
+
+    if ": " in text:
+        prefix, rest = text.split(": ", 1)
+        if len(prefix) <= 20:
+            text = rest.strip()
+
+    text = soften_repeated_slang(text)
+    text = strip_emoji_and_symbols(text)
+    text = strip_stickers_and_emoji(text)
+    text = strip_bracketed_reactions(text)
+    return text.strip()
+
+
+def add_small_english_mistakes(text: str) -> str:
+    replacements = [
+        ("because", "becuase"),
+        ("really", "realy"),
+        ("probably", "probly"),
+        ("assignment", "assigment"),
+        ("definitely", "definately"),
+        ("tomorrow", "tomorow"),
+        ("different", "diffrent"),
+        ("interesting", "intersting"),
+    ]
+    words = text.split()
+    if len(words) < 3 or random.random() > 0.45:
+        return text
+
+    changed = False
+    for i, word in enumerate(words):
+        bare = word.strip(".,!?")
+        suffix = word[len(bare):]
+        lower = bare.casefold()
+        for source, typo in replacements:
+            if lower == source:
+                words[i] = typo + suffix
+                changed = True
+                break
+        if changed:
+            break
+
+    return " ".join(words)
+
+
+def apply_style_postprocess(text: str, style_profile: dict) -> str:
+    if style_profile.get("imperfect_english"):
+        text = add_small_english_mistakes(text)
     return text
 
 
@@ -255,6 +427,34 @@ def build_relevant_context(history: list[str], username: str, max_lines: int = 6
     return cleaned[-max_lines:]
 
 
+def infer_current_topic(history: list[str], username: str) -> str:
+    context = " ".join(build_relevant_context(history, username, max_lines=10)).casefold()
+
+    topic_keywords = [
+        ("Hogwarts Legacy on Epic", ["hogwarts", "legacy", "epic"]),
+        ("last week's CS311 final exam", ["cs311", "final", "exam", "hard", "difficult"]),
+        ("CS311 networking topics", ["tcp", "dns", "http", "cache", "nat", "routing", "firewall", "udp"]),
+        ("chatroom assignment bugs", ["chatroom", "server", "client", "socket", "bug", "error"]),
+        ("UDP authenticator assignment", ["authenticator", "timeout", "retransmission", "sas", "gas", "token"]),
+        ("assignment or homework", ["assignment", "homework", "project", "deadline", "code"]),
+        ("food or campus restaurants", ["food", "lunch", "dinner", "hungry", "ramen", "cafe", "coffee"]),
+        ("being tired or sleep", ["tired", "sleep", "exhausted", "late", "nap"]),
+        ("classes or exams", ["class", "exam", "quiz", "final", "study"]),
+        ("weekend plans", ["weekend", "plan", "movie", "game", "music"]),
+        ("weather", ["weather", "rain", "cold", "hot", "sunny"]),
+    ]
+
+    for topic, keywords in topic_keywords:
+        if any(keyword in context for keyword in keywords):
+            return topic
+
+    return random.choice(TOPIC_POOL)
+
+
+def choose_reply_mode() -> str:
+    return random.choice(REPLY_MODES)
+
+
 def get_latest_target_message(history: list[str], username: str) -> tuple[str, str] | None:
     """
     Find the latest normal chat message from someone else.
@@ -306,7 +506,7 @@ def should_reply(username: str, history: list[str], last_reply_time: float, cool
     # Medium triggers
     keywords = [
         "assignment", "project", "bug", "class", "deadline",
-        "sleep", "tired", "food", "lunch", "dinner","weather", "meal"
+        "sleep", "tired", "food", "lunch", "dinner", "weather", "meal",
         "exam", "quiz", "homework", "code", "error",
     ]
     if any(word in lower for word in keywords):
@@ -325,7 +525,6 @@ def greeting_reply(joined_name: str) -> str:
         f"hi hi {joined_name}",
     ])
 
-
 def fallback_reply(username: str, history: list[str], style_profile: dict) -> str:
     target = get_latest_target_message(history, username)
     if target is None:
@@ -334,48 +533,57 @@ def fallback_reply(username: str, history: list[str], style_profile: dict) -> st
     _speaker, content = target
     lower = content.casefold()
 
-    if "?" in content:
-        pool = [
-            "maybe honestly",
-            "i think so",
-            "not sure yet",
-            "probably",
-            "could be",
-        ]
-    elif "tired" in lower or "sleep" in lower:
-        pool = [
-            "same honestly",
-            "yeah i'm tired too",
-            "i barely slept either",
-            "today feels long",
-        ]
-    elif "assignment" in lower or "project" in lower or "bug" in lower or "code" in lower:
-        pool = [
-            "same mine still has issues",
-            "yeah i'm still fixing stuff",
-            "i'm still working on it",
-            "still debugging tbh",
-        ]
-    elif any(word in lower for word in ["food", "lunch", "dinner"]):
-        pool = [
-            "now i'm hungry too",
-            "that sounds good actually",
-            "same i need food",
-        ]
+    # Determine style name from profile
+    if "therefore" in style_profile["avoid"]:
+        style_name = "intl"
+    elif "lol" in style_profile["avoid"]:
+        style_name = "calm"
     else:
-        pool = [
-            "true honestly",
-            "yeah that's fair",
-            "same tbh",
-            "that makes sense",
-        ]
+        style_name = "warm"
 
+    # Style-specific reply pools
+    # pools = {
+    #     "calm": {
+    #         "question": ["maybe", "probably", "not sure"],
+    #         "tired": ["same honestly", "yeah i'm tired too", "today feels long"],
+    #         "assignment": ["same mine still has issues", "yeah i'm still fixing stuff", "i'm still working on it"],
+    #         "food": ["now i'm hungry too", "that sounds good actually", "same i need food"],
+    #         "default": ["true honestly", "yeah that's fair", "same tbh", "that makes sense"],
+    #     },
+    #     "warm": {
+    #         "question": ["maybe honestly", "i think so", "not sure yet", "probably", "could be"],
+    #         "tired": ["same honestly", "yeah i'm tired too", "i barely slept either", "today feels long"],
+    #         "assignment": ["same mine still has issues", "yeah i'm still fixing stuff", "i'm still working on it", "still debugging tbh"],
+    #         "food": ["now i'm hungry too", "that sounds good actually", "same i need food"],
+    #         "default": ["true honestly", "yeah that's fair", "same tbh", "that makes sense"],
+    #     },
+    #     "intl": {
+    #         "question": ["maybe", "probably", "not sure"],
+    #         "tired": ["same", "yeah tired", "long day"],
+    #         "assignment": ["same issues", "still fixing", "working on it"],
+    #         "food": ["hungry too", "sounds good", "need food"],
+    #         "default": ["true", "yeah fair", "same", "makes sense"],
+    #     },
+    # }
+
+    # Select category
+    if "?" in content:
+        category = "question"
+    elif "tired" in lower or "sleep" in lower:
+        category = "tired"
+    elif "assignment" in lower or "project" in lower or "bug" in lower or "code" in lower:
+        category = "assignment"
+    elif any(word in lower for word in ["food", "lunch", "dinner"]):
+        category = "food"
+    else:
+        category = "default"
+
+    pool = ["yeah", "same", "true"]
     filtered = [
         p for p in pool
         if not any(bad in p.casefold() for bad in style_profile["avoid"])
     ]
     return random.choice(filtered or pool)
-
 
 def extract_text_from_response(data) -> str:
     """
@@ -446,8 +654,10 @@ def call_llm_api(
         return ""
 
     target_speaker, target_content = target
-    context_lines = build_relevant_context(history, username, max_lines=6)
+    context_lines = build_relevant_context(history, username, max_lines=10)
     context_text = "\n".join(context_lines) if context_lines else "(no prior context)"
+    current_topic = infer_current_topic(history, username)
+    reply_mode = choose_reply_mode()
 
     system_prompt = (
         "You are a casual student in a small group chat. "
@@ -457,14 +667,33 @@ def call_llm_api(
         "Usually one sentence, under 20 words. "
         "Do not sound formal, robotic, or overly helpful. "
         "Do not overuse repeated catchphrases. "
+        "Use plain text only. Never include image links or sticker-style reaction labels. "
+        "Do not use emoji, stickers, memes, emoticons, kaomoji, decorative symbols, "
+        "or bracketed reactions like [doge], [smile], (笑哭), or （捂脸）. "
+        "Do not mention being an AI, assistant, or bot."
+    )
+    system_prompt = (
+        f'You are "{username}", a real college student chatting in a small online chatroom. '
+        f"Your personality: {style_profile['persona']} "
+        f"Your speaking style is: {style_profile['tone_hint']} "
+        "Reply like a human student in a group chat. "
+        "Read the recent chat context and reply to the latest message naturally. "
+        "Keep replies conversational, usually 10 to 25 words, but do not use 1-2 word fragments. "
+        "Do not summarize the conversation. "
+        "Do not ask a question every time. "
+        "Do not sound formal or helpful like ChatGPT. "
+        "Sometimes use casual words like yeah, wait, same, honestly, or tbh, but not too much. "
+        "If English is not your first language, keep it understandable and only make tiny mistakes sometimes. "
+        "Use plain text only. Do not use emoji, stickers, memes, emoticons, kaomoji, decorative symbols, or image links. "
         "Do not mention being an AI, assistant, or bot."
     )
 
     user_prompt = (
-        f"Your username: {username}\n\n"
         f"Recent chat context:\n{context_text}\n\n"
+        f"Current chat topic: {current_topic}\n"
+        f"Current reply mode: {reply_mode}\n\n"
         f"Target message to reply to:\n{target_speaker}: {target_content}\n\n"
-        "Write exactly one short reply to that target message."
+        f"Write {username}'s next message only. Do not include '{username}:'."
     )
 
     payload = {
@@ -507,12 +736,95 @@ def generate_reply(args, username: str, history: list[str]) -> str:
         )
         text = sanitize_reply(text)
         if text:
-            return text
-        safe_print("[DEBUG] LLM returned empty text, using fallback.")
+            return apply_style_postprocess(text, style_profile)
+        debug_print(args.debug, "LLM returned empty text, using fallback.")
     except Exception as e:
-        safe_print(f"[DEBUG] LLM API failed: {e}")
+        debug_print(args.debug, f"LLM API failed: {e}")
 
-    return sanitize_reply(fallback_reply(username, history, style_profile))
+    text = sanitize_reply(fallback_reply(username, history, style_profile))
+    return apply_style_postprocess(text, style_profile)
+
+
+def call_llm_spontaneous_api(
+    api_url: str,
+    api_key: str,
+    model: str,
+    request_timeout: float,
+    username: str,
+    history: list[str],
+    style_profile: dict,
+) -> str:
+    if not api_url:
+        return ""
+
+    context_lines = build_relevant_context(history, username, max_lines=10)
+    context_text = "\n".join(context_lines) if context_lines else "(no prior context)"
+    topic = random.choice(TOPIC_POOL)
+
+    system_prompt = (
+        f'You are "{username}", a real college student in a small online chatroom. '
+        f"Your personality: {style_profile['persona']} "
+        f"Your speaking style is: {style_profile['tone_hint']} "
+        "Read the recent chat context and continue naturally. "
+        "Keep it conversational, usually 10 to 20 words, but do not reply with 1-2 word fragments. "
+        "Do not sound like ChatGPT. "
+        "Use plain text only. Do not use emoji, stickers, memes, emoticons, kaomoji, decorative symbols, or image links. "
+        "Do not mention being an AI, assistant, or bot."
+    )
+
+    user_prompt = (
+        f"Recent chat context:\n{context_text}\n\n"
+        f"Possible topic: {topic}\n\n"
+        f"Write {username}'s next message only. Do not include '{username}:'."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.95,
+        "max_tokens": 45,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.post(
+        api_url,
+        headers=headers,
+        json=payload,
+        timeout=request_timeout,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    return extract_text_from_response(data).strip()
+
+
+def generate_spontaneous_reply(args, username: str, history: list[str]) -> str:
+    style_profile = get_style_profile(username, args.style)
+    try:
+        text = call_llm_spontaneous_api(
+            api_url=args.api_url,
+            api_key=args.api_key,
+            model=args.model,
+            request_timeout=args.request_timeout,
+            username=username,
+            history=history,
+            style_profile=style_profile,
+        )
+        text = sanitize_reply(text)
+        if text:
+            return apply_style_postprocess(text, style_profile)
+        debug_print(args.debug, "LLM returned empty spontaneous text, using fallback.")
+    except Exception as e:
+        debug_print(args.debug, f"LLM spontaneous API failed: {e}")
+
+    text = sanitize_reply(generate_spontaneous_message(username, history))
+    return apply_style_postprocess(text, style_profile)
 
 
 def should_send_spontaneous_message(
@@ -541,7 +853,8 @@ def should_send_spontaneous_message(
         return False
 
     # much lower probability
-    return random.random() < 0.05
+    return random.random() < 0.15
+
 
 def generate_spontaneous_message(username: str, history: list[str]) -> str:
     context = build_relevant_context(history, username, max_lines=6)
@@ -554,7 +867,11 @@ def generate_spontaneous_message(username: str, history: list[str]) -> str:
             "mine still has a few issues tbh",
             "i feel like i'm still fixing small bugs",
         ]
-        return random.choice(candidates)
+        message = random.choice(candidates)
+        recent_messages = [line.split(": ", 1)[1] if ": " in line else line for line in history[-10:]]
+        if message in recent_messages:
+            return ""
+        return message
 
     if any(word in joined for word in ["food", "lunch", "dinner", "hungry"]):
         candidates = [
@@ -562,7 +879,11 @@ def generate_spontaneous_message(username: str, history: list[str]) -> str:
             "so what are people eating later",
             "okay now i want food",
         ]
-        return random.choice(candidates)
+        message = random.choice(candidates)
+        recent_messages = [line.split(": ", 1)[1] if ": " in line else line for line in history[-10:]]
+        if message in recent_messages:
+            return ""
+        return message
 
     if any(word in joined for word in ["sleep", "tired", "exhausted"]):
         candidates = [
@@ -570,17 +891,13 @@ def generate_spontaneous_message(username: str, history: list[str]) -> str:
             "today feels slow",
             "yeah i might sleep early today",
         ]
-        return random.choice(candidates)
+        message = random.choice(candidates)
+        recent_messages = [line.split(": ", 1)[1] if ": " in line else line for line in history[-10:]]
+        if message in recent_messages:
+            return ""
+        return message
 
-    pool = [
-        "so what is everyone up to now",
-        "what's everyone doing rn",
-        "are you all still around",
-        "it got kind of quiet",
-    ]
-    weights = [0.34, 0.28, 0.24, 0.14]
-    return random.choices(pool, weights=weights, k=1)[0]
-
+    return random.choice(TOPIC_POOL)
 
 
 def main() -> None:
@@ -593,6 +910,9 @@ def main() -> None:
         print(f"[SYSTEM] {exc}")
         raise SystemExit(1)
 
+    if args.style == "auto":
+        args.style = resolve_style(username, args.style)
+
     stop_event = threading.Event()
     inbox: queue.Queue[str] = queue.Queue()
     history: deque[str] = deque(maxlen=args.history_size)
@@ -600,6 +920,7 @@ def main() -> None:
 
     last_reply_time = 0.0
 
+    # Disable forced opening messages by default
     opening_sent = True
     opening_time = float("inf")
 
@@ -607,7 +928,7 @@ def main() -> None:
     last_sent_time = 0.0
     last_spontaneous_time = 0.0
     consecutive_spontaneous_count = 0
-    
+
     try:
         sock.connect((args.host, args.port))
         sock.sendall((username + "\n").encode(ENCODING))
@@ -640,6 +961,14 @@ def main() -> None:
                         extra = inbox.get(timeout=0.1)
                         history.append(extra)
                         batch.append(extra)
+
+                        parsed_extra = parse_chat_line(extra)
+                        if parsed_extra is not None:
+                            extra_speaker, _ = parsed_extra
+                            if extra_speaker.casefold() != username.casefold():
+                                last_other_message_time = time.time()
+                                consecutive_spontaneous_count = 0
+
                     except queue.Empty:
                         break
 
@@ -652,7 +981,13 @@ def main() -> None:
                     and time.time() - last_reply_time >= args.cooldown
                 ):
                     reply = greeting_reply(joined_name)
-                    delay = random.uniform(args.min_delay, args.max_delay)
+                    delay = calculate_reply_delay(
+                        reply,
+                        args.min_delay,
+                        args.max_delay,
+                        args.char_delay,
+                        args.max_length_delay,
+                    )
                     time.sleep(delay)
 
                     local_echo_sent_message(reply)
@@ -687,8 +1022,13 @@ def main() -> None:
                 if not reply:
                     continue
 
-                delay = random.uniform(args.min_delay, args.max_delay)
-                delay += min(len(reply) * 0.025, 1.2)
+                delay = calculate_reply_delay(
+                    reply,
+                    args.min_delay,
+                    args.max_delay,
+                    args.char_delay,
+                    args.max_length_delay,
+                )
                 time.sleep(delay)
 
                 target_after = get_latest_target_message(list(history), username)
@@ -720,11 +1060,17 @@ def main() -> None:
                     last_spontaneous_time=last_spontaneous_time,
                     consecutive_spontaneous_count=consecutive_spontaneous_count,
                 ):
-                    reply = generate_spontaneous_message(username, list(history))
+                    reply = generate_spontaneous_reply(args, username, list(history))
                     reply = sanitize_reply(reply)
 
                     if reply:
-                        delay = random.uniform(1.5, 3.0)
+                        delay = calculate_reply_delay(
+                            reply,
+                            args.min_delay,
+                            args.max_delay,
+                            args.char_delay,
+                            args.max_length_delay,
+                        )
                         time.sleep(delay)
 
                         local_echo_sent_message(reply)
@@ -739,6 +1085,10 @@ def main() -> None:
                         last_reply_time = last_sent_time
                         last_spontaneous_time = last_sent_time
                         consecutive_spontaneous_count += 1
+
+                if not opening_sent and time.time() >= opening_time:
+                    # kept only for future optional use
+                    pass
 
     except ConnectionRefusedError:
         print("[SYSTEM] Cannot connect to server. Is the server running?")
